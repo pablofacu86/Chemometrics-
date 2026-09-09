@@ -2593,29 +2593,60 @@ with tabs[8]:
                                 col_hp.metric(k, str(v))
                             st.caption(f"🔧 Method: {descripcion_opt_usada_r.get(nombre_detalle_r, 'n/a')}")
 
-                    fuente_r = st.radio("Predicted vs. actual on:", ["CV", "Test"] if "test" in res else ["CV"],
-                                         horizontal=True, key="fuente_reg",
-                                         help="'CV' shows the cross-validation predictions; 'Test' shows "
-                                              "the independent held-out test set, if one was configured.")
-                    if fuente_r == "CV":
-                        y_t, y_p, ids_f = res["cv"]["y_true"], res["cv"]["y_pred"], res["cv"]["ids"]
-                    else:
-                        y_t, y_p, ids_f = res["test"]["y_true"], res["test"]["y_pred"], res["test"]["ids"]
+                    hay_test_r = "test" in res
+                    y_t_cv, y_p_cv, ids_cv = res["cv"]["y_true"], res["cv"]["y_pred"], res["cv"]["ids"]
 
-                    fig_pred = px.scatter(x=y_t, y=y_p, hover_name=ids_f,
-                                          labels={"x": "Actual value", "y": "Predicted value"})
-                    lim_lo, lim_hi = min(y_t.min(), y_p.min()), max(y_t.max(), y_p.max())
+                    fig_pred = go.Figure()
+                    fig_pred.add_trace(go.Scatter(
+                        x=y_t_cv, y=y_p_cv, mode="markers", name="Training (CV)",
+                        marker=dict(color="#185FA5", size=8),
+                        text=ids_cv, hovertemplate="%{text}<br>Actual: %{x}<br>Predicted: %{y}<extra></extra>",
+                    ))
+                    todos_valores = [y_t_cv, y_p_cv]
+                    if hay_test_r:
+                        y_t_test, y_p_test, ids_test = res["test"]["y_true"], res["test"]["y_pred"], res["test"]["ids"]
+                        fig_pred.add_trace(go.Scatter(
+                            x=y_t_test, y=y_p_test, mode="markers", name="Test",
+                            marker=dict(color="#D97706", size=9, symbol="diamond"),
+                            text=ids_test, hovertemplate="%{text}<br>Actual: %{x}<br>Predicted: %{y}<extra></extra>",
+                        ))
+                        todos_valores += [y_t_test, y_p_test]
+
+                    lim_lo = min(arr.min() for arr in todos_valores)
+                    lim_hi = max(arr.max() for arr in todos_valores)
                     fig_pred.add_trace(go.Scatter(x=[lim_lo, lim_hi], y=[lim_lo, lim_hi], mode="lines",
                                                    line=dict(dash="dash", color="gray"), name="Ideal (y=x)"))
-                    fig_pred.update_layout(height=450, title=f"Predicted vs. actual — {nombre_detalle_r} ({fuente_r})")
+                    fig_pred.update_layout(height=470, title=f"Predicted vs. actual — {nombre_detalle_r}",
+                                            xaxis_title="Actual value", yaxis_title="Predicted value")
                     st.plotly_chart(fig_pred, width='stretch')
 
-                    df_exp_r = mu.exportar_predicciones_regresion(ids_f, y_t, y_p)
-                    st.download_button(
-                        f"⬇️ Download predictions ({nombre_detalle_r}, {fuente_r})",
-                        data=df_exp_r.to_csv(index=False).encode("utf-8"),
-                        file_name=f"predictions_{nombre_detalle_r}_{fuente_r}.csv", mime="text/csv",
+                    df_exp_cv = mu.exportar_predicciones_regresion(ids_cv, y_t_cv, y_p_cv)
+                    if hay_test_r:
+                        col_dl_cv, col_dl_test = st.columns(2)
+                    else:
+                        col_dl_cv = st.container()
+                    col_dl_cv.download_button(
+                        f"⬇️ Download predictions ({nombre_detalle_r}, Training/CV)",
+                        data=df_exp_cv.to_csv(index=False).encode("utf-8"),
+                        file_name=f"predictions_{nombre_detalle_r}_CV.csv", mime="text/csv",
+                        key="descargar_pred_reg_cv",
                     )
+                    if hay_test_r:
+                        df_exp_test = mu.exportar_predicciones_regresion(ids_test, y_t_test, y_p_test)
+                        col_dl_test.download_button(
+                            f"⬇️ Download predictions ({nombre_detalle_r}, Test)",
+                            data=df_exp_test.to_csv(index=False).encode("utf-8"),
+                            file_name=f"predictions_{nombre_detalle_r}_Test.csv", mime="text/csv",
+                            key="descargar_pred_reg_test",
+                        )
+
+                    # Diagnostics further below (Williams plot, PDF report, model card) need a
+                    # single dataset — prefer Test when available (a more honest check of
+                    # generalization), otherwise fall back to the CV predictions.
+                    if hay_test_r:
+                        y_t, y_p, ids_f, fuente_r = y_t_test, y_p_test, ids_test, "Test"
+                    else:
+                        y_t, y_p, ids_f, fuente_r = y_t_cv, y_p_cv, ids_cv, "Training (CV)"
 
                     with st.expander(f"📈 Learning curve — {nombre_detalle_r}"):
                         st.caption("Shows performance vs. how many training samples were used. If both "
