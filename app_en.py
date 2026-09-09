@@ -100,6 +100,74 @@ def df_a_excel_bytes(hojas):
     return buffer.getvalue()
 
 
+# =============================================================================
+# CACHED, EXPENSIVE COMPUTATIONS
+# -----------------------------------------------------------------------
+# Streamlit reruns the ENTIRE script top-to-bottom on every single widget
+# interaction, anywhere in the app — including tabs that have nothing to do
+# with the widget that was actually touched. Without caching, that means
+# toggling something as unrelated as "variable selection method" in the
+# Classification tab would still silently recompute preprocessing, refit
+# PCA, and recompute outlier statistics from scratch every single time,
+# which is the main reason simple UI interactions could feel sluggish
+# (especially on a shared/limited CPU). These cached wrappers make each of
+# those only actually recompute when their real inputs change.
+# =============================================================================
+
+@st.cache_data(show_spinner=False)
+def _leer_archivo_cacheado(bytes_archivo, nombre_archivo, hoja, fila_encabezado):
+    """Cached raw file read + header-row parsing, keyed by the file's own
+    bytes (not just its name) — so re-parsing only happens when the file, the
+    chosen sheet, or the header row actually change, not on every rerun."""
+    buffer = io.BytesIO(bytes_archivo)
+    if nombre_archivo.lower().endswith(".csv"):
+        return pd.read_csv(buffer, header=fila_encabezado - 1)
+    return pd.read_excel(buffer, header=fila_encabezado - 1, sheet_name=hoja)
+
+
+@st.cache_data(show_spinner=False)
+def _leer_preview_cacheada(bytes_archivo, nombre_archivo, hoja):
+    """Cached raw preview (first rows, no header assumed) for the
+    'raw preview' expander."""
+    buffer = io.BytesIO(bytes_archivo)
+    if nombre_archivo.lower().endswith(".csv"):
+        return pd.read_csv(buffer, header=None, nrows=6)
+    return pd.read_excel(buffer, header=None, nrows=6, sheet_name=hoja)
+
+
+@st.cache_data(show_spinner=False)
+def _aplicar_pretratamiento_cacheado(X_paso0, secuencia):
+    """Cached preprocessing: only recomputes when the raw data or the chosen
+    steps/parameters actually change, not on every unrelated rerun."""
+    X_pret = X_paso0.copy()
+    for paso_tup in secuencia:
+        X_pret = aplicar_paso(X_pret, paso_tup)
+    return X_pret
+
+
+@st.cache_resource(show_spinner=False)
+def _ajustar_pca_cacheado(X_pca_input, n_comp_max):
+    """Cached PCA fit. Uses cache_resource (not cache_data) because it
+    returns the fitted scikit-learn PCA object itself, which other tabs
+    reuse directly (e.g. for its .transform() and .mean_) — cache_resource
+    avoids deep-copying that object on every cache hit."""
+    return PCA(n_components=n_comp_max).fit(X_pca_input)
+
+
+@st.cache_data(show_spinner=False)
+def _calcular_outliers_cacheado(X_pca_input, scores_completo, cargas_completo,
+                                 autovalores, media_pca, n_comp, alpha):
+    """Cached Hotelling's T² / residual Q computation for the Outliers tab."""
+    T2 = cu.calcular_T2(scores_completo, autovalores, n_comp)
+    T2_lim = cu.limite_T2(X_pca_input.shape[0], n_comp, alpha)
+    Q = cu.calcular_Q(X_pca_input, scores_completo, cargas_completo, n_comp, media=media_pca)
+    Q_lim = cu.limite_Q(autovalores, n_comp, alpha)
+    Q_lim_confiable = cu.limite_Q_confiable(Q, Q_lim)
+    if not Q_lim_confiable:
+        Q_lim = float(np.percentile(Q, 100 * (1 - alpha)))
+    return T2, T2_lim, Q, Q_lim, Q_lim_confiable
+
+
 def df_variables_seleccionadas(eje, mascara):
     """Table with the detail of the selected variables (wavenumbers)."""
     idx_sel = np.where(mascara)[0]
@@ -225,11 +293,11 @@ with st.sidebar:
         try:
             id_archivo = getattr(archivo, "file_id", None) or f"{archivo.name}_{archivo.size}"
             es_excel = not archivo.name.lower().endswith(".csv")
+            bytes_archivo = archivo.getvalue()
 
             hoja_elegida = None
             if es_excel:
-                archivo.seek(0)
-                nombres_hojas = pd.ExcelFile(archivo).sheet_names
+                nombres_hojas = pd.ExcelFile(io.BytesIO(bytes_archivo)).sheet_names
                 if len(nombres_hojas) > 1:
                     hoja_elegida = st.selectbox(
                         "Sheet", nombres_hojas, key=f"hoja_{id_archivo}",
@@ -238,14 +306,8 @@ with st.sidebar:
                 else:
                     hoja_elegida = nombres_hojas[0]
 
-            def _leer_crudo(archivo, n_filas=None, encabezado=None):
-                archivo.seek(0)
-                if archivo.name.lower().endswith(".csv"):
-                    return pd.read_csv(archivo, header=encabezado, nrows=n_filas)
-                return pd.read_excel(archivo, header=encabezado, nrows=n_filas, sheet_name=hoja_elegida)
-
             with st.expander("👁️ Raw preview (to choose the header row)"):
-                df_crudo = _leer_crudo(archivo, n_filas=6, encabezado=None)
+                df_crudo = _leer_preview_cacheada(bytes_archivo, archivo.name, hoja_elegida)
                 st.dataframe(df_crudo, width='stretch')
 
             fila_encabezado = st.number_input(
@@ -255,7 +317,7 @@ with st.sidebar:
                 key=f"fila_encabezado_{id_archivo}",
             )
 
-            df_completo = _leer_crudo(archivo, n_filas=None, encabezado=fila_encabezado - 1)
+            df_completo = _leer_archivo_cacheado(bytes_archivo, archivo.name, hoja_elegida, fila_encabezado)
             # Normalize column labels to text right away. Excel keeps numeric
             # header cells (e.g. wavenumbers) as actual int/float column labels,
             # while CSV headers are always text — without this, selecting a
@@ -725,10 +787,8 @@ with tabs[1]:
     secuencia = [paso_a_tup, paso_b_tup] if orden.startswith("A") else [paso_b_tup, paso_a_tup]
 
     error_pretratamiento = None
-    X_pret = X_paso0.copy()
     try:
-        for paso_tup in secuencia:
-            X_pret = aplicar_paso(X_pret, paso_tup)
+        X_pret = _aplicar_pretratamiento_cacheado(X_paso0, tuple(secuencia))
     except Exception as e:
         error_pretratamiento = str(e)
         X_pret = X_paso0.copy()
@@ -814,7 +874,7 @@ with tabs[2]:
     if n_comp_max < 2:
         st.warning("At least 3 samples are needed to compute PCA.")
     else:
-        pca_completo = PCA(n_components=n_comp_max).fit(X_pca_input)
+        pca_completo = _ajustar_pca_cacheado(X_pca_input, n_comp_max)
         scores_completo = pca_completo.transform(X_pca_input)
         cargas_completo = pca_completo.components_
         autovalores = pca_completo.explained_variance_
@@ -938,14 +998,10 @@ with tabs[3]:
                                    ["T² and Q (both, conservative)", "T² or Q (either, aggressive)",
                                     "T² only", "Q only"])
 
-        T2 = cu.calcular_T2(scores_completo, autovalores, n_comp)
-        T2_lim = cu.limite_T2(n_muestras, n_comp, alpha)
-        Q = cu.calcular_Q(X_pca_input, scores_completo, cargas_completo, n_comp, media=pca_completo.mean_)
-        Q_lim = cu.limite_Q(autovalores, n_comp, alpha)
-
-        Q_lim_confiable = cu.limite_Q_confiable(Q, Q_lim)
+        T2, T2_lim, Q, Q_lim, Q_lim_confiable = _calcular_outliers_cacheado(
+            X_pca_input, scores_completo, cargas_completo, autovalores, pca_completo.mean_, n_comp, alpha,
+        )
         if not Q_lim_confiable:
-            Q_lim = np.percentile(Q, 100 * (1 - alpha))
             st.warning(
                 "⚠ The theoretical Q limit (Jackson-Mudholkar) is not reliable with this "
                 "'n_comp' (happens when almost all the variance is already explained). "

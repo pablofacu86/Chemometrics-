@@ -42,6 +42,105 @@ from xgboost import XGBClassifier, XGBRegressor
 # interfaz, así que se arman como wrappers compatibles con scikit-learn)
 # =============================================================================
 
+class MLPClassifierWrapper(BaseEstimator, ClassifierMixin):
+    """
+    Wrapper around MLPClassifier that encodes classes to integers
+    internally and returns predictions using the original labels. This
+    works around a real scikit-learn limitation: MLPClassifier with
+    early_stopping=True crashes (TypeError inside its internal validation
+    scoring) when given string class labels directly — encoding to
+    integers first avoids that entirely, while still letting us use
+    early_stopping (which is what keeps training from grinding on for the
+    full max_iter budget on every fold when the network isn't improving —
+    the main reason a Neural Network model can otherwise take several
+    minutes per fold on limited hardware).
+    """
+
+    def __init__(self, hidden_layer_sizes=(50,), max_iter=500, early_stopping=True,
+                 n_iter_no_change=15, alpha=0.0001, random_state=0):
+        self.hidden_layer_sizes = hidden_layer_sizes
+        self.max_iter = max_iter
+        self.early_stopping = early_stopping
+        self.n_iter_no_change = n_iter_no_change
+        self.alpha = alpha
+        self.random_state = random_state
+
+    def fit(self, X, y):
+        self.encoder_ = LabelEncoder()
+        y_enc = self.encoder_.fit_transform(y)
+        try:
+            self.modelo_ = MLPClassifier(
+                hidden_layer_sizes=self.hidden_layer_sizes, max_iter=self.max_iter,
+                early_stopping=self.early_stopping, n_iter_no_change=self.n_iter_no_change,
+                alpha=self.alpha, random_state=self.random_state,
+            )
+            self.modelo_.fit(X, y_enc)
+        except ValueError as e:
+            # early_stopping carves out an internal validation split (10% of
+            # the training data by default) — with very few samples (a small
+            # CV fold, a small dataset, or a rare class), that split can end
+            # up too small or missing a class entirely, and sklearn raises
+            # here instead of just proceeding. Retry once without
+            # early_stopping in that specific case (max_iter is still capped,
+            # so this doesn't reintroduce the "grinds forever" problem).
+            if "validation set is too small" in str(e) or "least populated class" in str(e):
+                self.modelo_ = MLPClassifier(
+                    hidden_layer_sizes=self.hidden_layer_sizes, max_iter=self.max_iter,
+                    early_stopping=False, random_state=self.random_state,
+                )
+                self.modelo_.fit(X, y_enc)
+            else:
+                raise
+        self.classes_ = self.encoder_.classes_
+        return self
+
+    def predict(self, X):
+        pred_enc = self.modelo_.predict(X)
+        return self.encoder_.inverse_transform(pred_enc)
+
+    def predict_proba(self, X):
+        return self.modelo_.predict_proba(X)
+
+
+class MLPRegressorWrapper(BaseEstimator, RegressorMixin):
+    """
+    Thin wrapper around MLPRegressor that retries without early_stopping if
+    the internal validation split ends up too small for a given fold/dataset
+    size (same safety fallback as MLPClassifierWrapper — see its docstring).
+    """
+
+    def __init__(self, hidden_layer_sizes=(50,), max_iter=500, early_stopping=True,
+                 n_iter_no_change=15, alpha=0.0001, random_state=0):
+        self.hidden_layer_sizes = hidden_layer_sizes
+        self.max_iter = max_iter
+        self.early_stopping = early_stopping
+        self.n_iter_no_change = n_iter_no_change
+        self.alpha = alpha
+        self.random_state = random_state
+
+    def fit(self, X, y):
+        try:
+            self.modelo_ = MLPRegressor(
+                hidden_layer_sizes=self.hidden_layer_sizes, max_iter=self.max_iter,
+                early_stopping=self.early_stopping, n_iter_no_change=self.n_iter_no_change,
+                alpha=self.alpha, random_state=self.random_state,
+            )
+            self.modelo_.fit(X, y)
+        except ValueError as e:
+            if "validation set is too small" in str(e):
+                self.modelo_ = MLPRegressor(
+                    hidden_layer_sizes=self.hidden_layer_sizes, max_iter=self.max_iter,
+                    early_stopping=False, random_state=self.random_state,
+                )
+                self.modelo_.fit(X, y)
+            else:
+                raise
+        return self
+
+    def predict(self, X):
+        return self.modelo_.predict(X)
+
+
 class PLSDAClassifier(BaseEstimator, ClassifierMixin):
     """
     PLS-DA: PLS de regresión sobre las clases codificadas como variables
@@ -103,18 +202,33 @@ class PCRRegressor(BaseEstimator, RegressorMixin):
 
 class XGBClassifierWrapper(BaseEstimator, ClassifierMixin):
     """
-    Wrapper de XGBClassifier que codifica las clases a enteros internamente
-    (XGBoost lo exige) y devuelve las predicciones en las etiquetas
-    originales, para que se comporte igual que el resto de los clasificadores.
+    Wrapper around XGBClassifier that encodes classes to integers
+    internally (XGBoost requires this) and returns predictions using the
+    original labels, so it behaves like every other classifier. Exposes
+    its hyperparameters as REAL named __init__ parameters (not a generic
+    **kwargs blob) — this is required for scikit-learn's parameter
+    introspection (get_params/set_params/clone) to work correctly. Without
+    it, every cross-validation fold silently re-clones the estimator with
+    DEFAULT XGBoost settings instead of the ones actually configured here,
+    since a generic **kwargs constructor isn't visible to get_params().
     """
 
-    def __init__(self, **kwargs):
-        self.kwargs = kwargs
+    def __init__(self, n_estimators=300, max_depth=3, learning_rate=0.1,
+                 eval_metric="mlogloss", random_state=0):
+        self.n_estimators = n_estimators
+        self.max_depth = max_depth
+        self.learning_rate = learning_rate
+        self.eval_metric = eval_metric
+        self.random_state = random_state
 
     def fit(self, X, y):
         self.encoder_ = LabelEncoder()
         y_enc = self.encoder_.fit_transform(y)
-        self.modelo_ = XGBClassifier(**self.kwargs)
+        self.modelo_ = XGBClassifier(
+            n_estimators=self.n_estimators, max_depth=self.max_depth,
+            learning_rate=self.learning_rate, eval_metric=self.eval_metric,
+            random_state=self.random_state,
+        )
         self.modelo_.fit(X, y_enc)
         self.classes_ = self.encoder_.classes_
         return self
@@ -145,7 +259,10 @@ def crear_clasificadores(n_componentes_pls=5, random_state=0):
             n_estimators=300, eval_metric="mlogloss", random_state=random_state,
         ),
         "KNN": KNeighborsClassifier(n_neighbors=5),
-        "Neural Network (MLP)": MLPClassifier(hidden_layer_sizes=(50,), max_iter=2000, random_state=random_state),
+        "Neural Network (MLP)": MLPClassifierWrapper(
+            hidden_layer_sizes=(50,), max_iter=500, early_stopping=True,
+            n_iter_no_change=15, random_state=random_state,
+        ),
     }
 
 
@@ -163,7 +280,10 @@ def crear_regresores(n_componentes_pls=5, random_state=0):
         "Decision Tree": DecisionTreeRegressor(random_state=random_state),
         "XGBoost": XGBRegressor(n_estimators=300, random_state=random_state),
         "KNN": KNeighborsRegressor(n_neighbors=5),
-        "Neural Network (MLP)": MLPRegressor(hidden_layer_sizes=(50,), max_iter=2000, random_state=random_state),
+        "Neural Network (MLP)": MLPRegressorWrapper(
+            hidden_layer_sizes=(50,), max_iter=500, early_stopping=True,
+            n_iter_no_change=15, random_state=random_state,
+        ),
     }
 
 
