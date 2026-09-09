@@ -495,3 +495,28 @@ def fig_comparacion_pvalores(pvalores_df):
     ax.set_title("Pairwise p-values (paired t-test on CV folds)\nbold < 0.05 = likely a real difference", fontsize=9.5)
     fig.tight_layout()
     return fig
+
+
+def fig_dendrograma(Z, etiquetas, clases=None):
+    """Static dendrogram for PDF reports, with optional leaf-label coloring by class."""
+    from scipy.cluster import hierarchy
+    fig, ax = plt.subplots(figsize=(7.5, 4.5))
+    dend = hierarchy.dendrogram(Z, labels=list(etiquetas), ax=ax, color_threshold=0.7 * max(Z[:, 2]),
+                                 above_threshold_color="#8A8A85")
+    ax.set_ylabel("Distance")
+    ax.spines[["top", "right"]].set_visible(False)
+    if clases is not None:
+        clases_unicas = list(dict.fromkeys(clases))
+        colores = plt.cm.Set1(np.linspace(0, 1, len(clases_unicas)))
+        mapa_color = dict(zip(clases_unicas, colores))
+        id_a_clase = dict(zip(etiquetas, clases))
+        for tick_label in ax.get_xmajorticklabels():
+            clase_muestra = id_a_clase.get(tick_label.get_text())
+            if clase_muestra in mapa_color:
+                tick_label.set_color(mapa_color[clase_muestra])
+                tick_label.set_weight("bold")
+        handles = [plt.Line2D([0], [0], marker="s", linestyle="", color=c, label=cl)
+                   for cl, c in mapa_color.items()]
+        ax.legend(handles=handles, fontsize=8, frameon=False, loc="upper right")
+    fig.tight_layout()
+    return fig

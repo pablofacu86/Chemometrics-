@@ -81,6 +81,16 @@ PRESETS_OPTIMIZACION = {
 }
 
 
+def resetear_prefijo(prefijo):
+    """Clears every session_state key starting with 'prefijo' — used by the
+    per-tab 'Reset' buttons so leftover results from a previous run (a
+    different set of models, an old learning curve, an old p-value table...)
+    never linger on screen after starting a new analysis in that tab."""
+    claves_a_borrar = [k for k in st.session_state.keys() if k.startswith(prefijo)]
+    for k in claves_a_borrar:
+        del st.session_state[k]
+
+
 def df_a_excel_bytes(hojas):
     """Builds an in-memory .xlsx from a dict {sheet_name: DataFrame}."""
     buffer = io.BytesIO()
@@ -209,16 +219,30 @@ with st.sidebar:
     )
 
     clases_desde_archivo = None
+    valores_y_desde_archivo = None
 
     if archivo is not None:
         try:
             id_archivo = getattr(archivo, "file_id", None) or f"{archivo.name}_{archivo.size}"
+            es_excel = not archivo.name.lower().endswith(".csv")
+
+            hoja_elegida = None
+            if es_excel:
+                archivo.seek(0)
+                nombres_hojas = pd.ExcelFile(archivo).sheet_names
+                if len(nombres_hojas) > 1:
+                    hoja_elegida = st.selectbox(
+                        "Sheet", nombres_hojas, key=f"hoja_{id_archivo}",
+                        help="This Excel file has more than one sheet — pick which one to load.",
+                    )
+                else:
+                    hoja_elegida = nombres_hojas[0]
 
             def _leer_crudo(archivo, n_filas=None, encabezado=None):
                 archivo.seek(0)
                 if archivo.name.lower().endswith(".csv"):
                     return pd.read_csv(archivo, header=encabezado, nrows=n_filas)
-                return pd.read_excel(archivo, header=encabezado, nrows=n_filas)
+                return pd.read_excel(archivo, header=encabezado, nrows=n_filas, sheet_name=hoja_elegida)
 
             with st.expander("👁️ Raw preview (to choose the header row)"):
                 df_crudo = _leer_crudo(archivo, n_filas=6, encabezado=None)
@@ -251,12 +275,22 @@ with st.sidebar:
                 )
             with col2:
                 opcion_clase = st.selectbox(
-                    "Class column (if already in the file)",
+                    "Class column (for classification / SIMCA, if already in the file)",
                     ["(none)"] + columnas,
                     key=f"opcion_clase_{id_archivo}",
-                    help="Which column holds the class/group label for each sample, if your file "
-                         "already includes one. Leave as 'none' to define classes another way below.",
+                    help="Which column holds the class/group label for each sample. Only use this for "
+                         "a CATEGORICAL label (e.g. origin, variety). Leave as 'none' if you don't need "
+                         "classification, or if your target is a continuous number — use the reference "
+                         "value column below for that instead.",
                 )
+            opcion_valor_y = st.selectbox(
+                "Reference value column (for regression, if already in the file)",
+                ["(none)"] + columnas,
+                key=f"opcion_valory_{id_archivo}",
+                help="Which column holds the continuous numeric value you want to predict with "
+                     "regression (e.g. a lab-measured concentration). This is different from the class "
+                     "column above — use this one for numbers, not categories.",
+            )
 
             columnas_restantes = columnas.copy()
 
@@ -265,16 +299,42 @@ with st.sidebar:
             else:
                 ids = df_completo[opcion_id].astype(str).to_numpy()
                 columnas_restantes.remove(opcion_id)
+                n_duplicados = len(ids) - len(set(ids))
+                if n_duplicados > 0:
+                    st.warning(f"⚠️ The ID column has {n_duplicados} repeated value(s) — sample IDs "
+                               "should normally be unique (otherwise things like exported predictions "
+                               "become hard to trace back to a specific sample). Making them unique by "
+                               "appending a running number.")
+                    contador = {}
+                    ids_unicos = []
+                    for i in ids:
+                        contador[i] = contador.get(i, 0) + 1
+                        ids_unicos.append(i if contador[i] == 1 else f"{i}_{contador[i]}")
+                    ids = np.array(ids_unicos)
 
             if opcion_clase != "(none)":
                 clases_desde_archivo = df_completo[opcion_clase].astype(str).to_numpy()
                 if opcion_clase in columnas_restantes:
                     columnas_restantes.remove(opcion_clase)
 
+            if opcion_valor_y != "(none)":
+                try:
+                    valores_y_desde_archivo = pd.to_numeric(df_completo[opcion_valor_y]).to_numpy(dtype=float)
+                except (ValueError, TypeError):
+                    st.error(f"Column '{opcion_valor_y}' has non-numeric values — it can't be used as "
+                             "a regression reference value.")
+                    valores_y_desde_archivo = None
+                if opcion_valor_y in columnas_restantes:
+                    columnas_restantes.remove(opcion_valor_y)
+
             numeros_onda = np.array(columnas_restantes, dtype=float)
             X = df_completo[columnas_restantes].to_numpy(dtype=float)
 
             cambio_tamano = (st.session_state.X is None) or (st.session_state.X.shape[0] != X.shape[0])
+            archivo_realmente_nuevo = (
+                st.session_state.get("archivo_cargado_id") is not None
+                and st.session_state.get("archivo_cargado_id") != id_archivo
+            )
             df_final = pd.DataFrame(X, index=ids, columns=numeros_onda)
             df_final.index.name = "id"
 
@@ -286,12 +346,30 @@ with st.sidebar:
                 st.session_state.mascara_excluidas = np.zeros(X.shape[0], dtype=bool)
                 if clases_desde_archivo is None:
                     st.session_state.clases = None
+                if valores_y_desde_archivo is None:
+                    st.session_state.valores_y = None
             if clases_desde_archivo is not None:
                 st.session_state.clases = clases_desde_archivo
+            if valores_y_desde_archivo is not None:
+                st.session_state.valores_y = valores_y_desde_archivo
+            if archivo_realmente_nuevo:
+                # A genuinely different file was loaded (not just a re-parse of the same one) —
+                # clear any trained-model results from the PREVIOUS dataset so stale
+                # tables/plots referencing old samples can't linger on screen. Saved models
+                # (in "Predict" tab) are intentionally kept, since re-using an already-trained
+                # model on a new file is a legitimate workflow.
+                resetear_prefijo("clf_")
+                resetear_prefijo("reg_")
+                resetear_prefijo("simca_")
+                resetear_prefijo("mcr_")
             st.session_state["archivo_cargado_id"] = id_archivo
             st.session_state["archivo_cargado_nombre"] = archivo.name
 
-            st.success(f"{X.shape[0]} samples × {X.shape[1]} variables")
+            st.success(f"{X.shape[0]} samples × {X.shape[1]} variables"
+                       + (" · reference values loaded" if valores_y_desde_archivo is not None else ""))
+            if archivo_realmente_nuevo:
+                st.caption("ℹ️ New file detected — previous Classification/Regression/SIMCA results "
+                           "were cleared. Saved models (for the Predict tab) were kept.")
         except Exception as e:
             st.error(f"Could not read '{archivo.name}' with that configuration: {e}")
             if st.session_state.get("archivo_cargado_nombre") not in (None, archivo.name):
@@ -921,6 +999,20 @@ with tabs[3]:
         st.markdown(f"**Outlier candidates with this criterion ({len(candidatos)}):** "
                     + (", ".join(candidatos) if len(candidatos) else "none"))
 
+        if clases is not None and len(candidatos) > 0:
+            conteo_candidatos_por_clase = pd.Series(clases[es_outlier]).value_counts()
+            conteo_total_por_clase = pd.Series(clases).value_counts()
+            proporciones = (conteo_candidatos_por_clase / conteo_total_por_clase).dropna()
+            clases_con_muchos = proporciones[proporciones > 0.3].index.tolist()
+            if clases_con_muchos:
+                st.info(f"ℹ️ A large share of class(es) **{', '.join(clases_con_muchos)}** show up here. "
+                        "This outlier detection compares every sample to a SINGLE overall model — if a "
+                        "whole class is chemically quite different from the rest, much of it can look "
+                        "like an 'outlier' even though it's really just a distinct, valid population. "
+                        "If that looks like what's happening, consider the **SIMCA** tab instead: it "
+                        "builds a separate model per class, so a class won't be penalized just for "
+                        "being different from the others.")
+
         col_a, col_b = st.columns(2)
         if col_a.button("🚫 Exclude these samples from the analysis", disabled=(len(candidatos) == 0)):
             idx_global = np.array([np.where(st.session_state.ids == i)[0][0] for i in candidatos])
@@ -971,7 +1063,14 @@ with tabs[3]:
                 {"tipo": "imagen", "fig": ru.fig_outliers(
                     T2, Q, T2_lim, Q_lim, T2_lo, T2_hi, Q_lo, Q_hi,
                     clases=como_texto(clases) if clases is not None else None)},
+                {"tipo": "salto_pagina"},
+                {"tipo": "titulo", "texto": "4. Hierarchical Cluster Analysis (HCA)"},
+                {"tipo": "clave_valor", "pares": [("Linkage method", "ward")]},
             ]
+            if X_pca_input.shape[0] >= 3:
+                Z_reporte = hierarchy.linkage(X_pca_input, method="ward")
+                secciones_rep_exp.append({"tipo": "imagen", "fig": ru.fig_dendrograma(
+                    Z_reporte, list(ids), clases=como_texto(clases) if clases is not None else None)})
             pdf_reporte_exp = ru.generar_reporte(
                 "Exploratory Analysis Report",
                 f"{X_pca_input.shape[0]} samples - {n_comp} principal components", secciones_rep_exp,
@@ -996,7 +1095,18 @@ with tabs[4]:
         st.warning("At least 3 samples are needed.")
     else:
         col1, col2 = st.columns(2)
-        metodo = col1.selectbox("Linkage method", ["ward", "average", "complete", "single"])
+        metodo = col1.selectbox(
+            "Linkage method", ["ward", "average", "complete", "single"],
+            help="How the distance between two CLUSTERS (not individual samples) is defined when "
+                 "deciding what to merge next:\n"
+                 "• ward: merges the pair that increases within-cluster variance the least — usually "
+                 "gives the most balanced, compact clusters (good default).\n"
+                 "• average: distance = average distance between all pairs across the two clusters.\n"
+                 "• complete: distance = the FARTHEST pair between the two clusters — tends to give "
+                 "tight, evenly-sized clusters, sensitive to outliers.\n"
+                 "• single: distance = the CLOSEST pair between the two clusters — can chain together "
+                 "long, straggly clusters (sensitive to noise, but can find elongated shapes).",
+        )
         vista = col2.radio("Dendrogram type", ["Linear (interactive)", "Circular"], horizontal=True)
 
         Z = hierarchy.linkage(X_hca, method=metodo, metric="euclidean")
@@ -1238,6 +1348,11 @@ with tabs[5]:
 # -----------------------------------------------------------------------
 with tabs[6]:
     st.subheader("Supervised classification")
+    if st.button("🔄 Reset this tab", key="reset_clf",
+                 help="Clears all trained models, metrics, and plots from this tab, so you can "
+                      "start a completely fresh run without any leftover results from before."):
+        resetear_prefijo("clf_")
+        st.rerun()
 
     ids_activos, X_activo_clf, clases_activas = datos_activos()
     X_modelado = st.session_state.X_pret[indice_activo()]
@@ -1291,15 +1406,17 @@ with tabs[6]:
                     "Test set selection", ["Random", "Kennard-Stone (representative)"],
                     disabled=(prop_test == 0),
                     help="How to choose which samples go into the test set. 'Random' picks them by "
-                         "chance (stratified by class). 'Kennard-Stone' deliberately spreads the "
-                         "training set across the full spectral range instead.",
+                         "chance (stratified by class). 'Kennard-Stone' spreads the training set "
+                         "across the spectral range within each class instead — every class still "
+                         "ends up represented in both train and test.",
                 )
                 metodo_split = "kennard_stone" if metodo_split_sel.startswith("Kennard-Stone") else "random"
                 if metodo_split == "kennard_stone":
                     st.caption("ℹ️ Kennard-Stone picks the TRAINING set to broadly cover the spectral "
-                               "space (it will include the more 'extreme' samples); the remaining, more "
-                               "'typical' samples become the test set. Not stratified by class — check the "
-                               "resulting class balance if your classes are very uneven.")
+                               "space within EACH class separately (it will include the more 'extreme' "
+                               "samples of each class); the remaining, more 'typical' samples of each "
+                               "class become the test set — so every class is guaranteed to appear in "
+                               "both.")
                 optimizar = st.checkbox(
                     "Optimize hyperparameters (slower)",
                     help="Automatically search for better settings for each model (e.g. how many "
@@ -1322,18 +1439,38 @@ with tabs[6]:
                 st.caption(f"⚠ Optimizing hyperparameters for {', '.join(lentos_elegidos)} can still take a while "
                            f"on a shared/limited CPU. If it's too slow, try 'Fast', or fewer folds.{extra}")
 
+            if metodo_seleccion == "Boruta":
+                c1, c2 = st.columns(2)
+                boruta_max_iter = c1.slider(
+                    "Boruta iterations", 10, 150, 40, step=5, key="boruta_iter_clf",
+                    help="How many comparison rounds to run against the random 'shadow' variables. "
+                         "More iterations give a more stable decision but take longer.",
+                )
+                boruta_alpha = c2.select_slider(
+                    "Boruta p-value (alpha)", options=[0.01, 0.02, 0.05, 0.1], value=0.05, key="boruta_alpha_clf",
+                    help="Significance level for keeping a variable: smaller (e.g. 0.01) is stricter "
+                         "and keeps fewer, more confidently relevant variables; larger (e.g. 0.1) is "
+                         "more permissive.",
+                )
             if metodo_seleccion == "Genetic Algorithm":
                 c1, c2 = st.columns(2)
                 ga_poblacion = c1.slider("Population size", 10, 60, 20, key="ga_pob_clf")
                 ga_generaciones = c2.slider("Generations", 5, 50, 15, key="ga_gen_clf")
 
             if st.button("🚀 Train and evaluate (Classification)", disabled=len(modelos_elegidos) == 0):
+                # Clear secondary results tied to the PREVIOUS set of trained models (a
+                # statistical comparison or learning curve computed for models A/B/C would
+                # otherwise linger on screen after retraining with a different D/E/F).
+                for _clave in ["clf_pvalores", "clf_puntajes_cv", "clf_comparacion_metodo",
+                                "clf_curva_aprendizaje", "clf_curva_modelo", "clf_ultima_ficha"]:
+                    st.session_state.pop(_clave, None)
                 mascara_variables = None
                 with st.spinner("Selecting variables..." if metodo_seleccion != "None" else "Training..."):
                     if metodo_seleccion == "Boruta":
                         try:
                             mascara_variables = mu.seleccionar_variables_boruta(
-                                X_modelado, clases_activas, es_clasificacion=True, max_iter=40,
+                                X_modelado, clases_activas, es_clasificacion=True,
+                                max_iter=boruta_max_iter, alpha=boruta_alpha,
                             )
                             if mascara_variables.sum() == 0:
                                 st.warning("Boruta did not select any variable; using all of them.")
@@ -1524,9 +1661,12 @@ with tabs[6]:
                     res = resultados[nombre_detalle]
 
                     if hiperparametros_optimos.get(nombre_detalle):
-                        st.caption("⚙️ Optimal hyperparameters found: " +
-                                   ", ".join(f"{k}={v}" for k, v in hiperparametros_optimos[nombre_detalle].items()))
-                        st.caption(f"🔧 Optimization method: {descripcion_opt_usada.get(nombre_detalle, 'n/a')}")
+                        with st.container(border=True):
+                            st.markdown(f"**⚙️ Optimized hyperparameters — {nombre_detalle}**")
+                            cols_hp = st.columns(len(hiperparametros_optimos[nombre_detalle]))
+                            for col_hp, (k, v) in zip(cols_hp, hiperparametros_optimos[nombre_detalle].items()):
+                                col_hp.metric(k, str(v))
+                            st.caption(f"🔧 Method: {descripcion_opt_usada.get(nombre_detalle, 'n/a')}")
 
                     fuente = st.radio("Confusion matrix on:", ["CV", "Test"] if "test" in res else ["CV"],
                                        horizontal=True, key="fuente_matriz_clf",
@@ -1744,6 +1884,11 @@ with tabs[6]:
 # -----------------------------------------------------------------------
 with tabs[7]:
     st.subheader("SIMCA — Soft Independent Modeling of Class Analogies")
+    if st.button("🔄 Reset this tab", key="reset_simca",
+                 help="Clears all trained SIMCA models and results from this tab, so you can start "
+                      "a completely fresh run without any leftover results from before."):
+        resetear_prefijo("simca_")
+        st.rerun()
     st.caption("Unlike LDA/PLS-DA/Random Forest (which always force a pick among the trained "
                "classes), SIMCA builds one PCA model PER CLASS and asks, independently for each "
                "one, 'does this sample look like a member of this class?'. A sample can end up "
@@ -2015,6 +2160,11 @@ with tabs[7]:
 # -----------------------------------------------------------------------
 with tabs[8]:
     st.subheader("Supervised regression")
+    if st.button("🔄 Reset this tab", key="reset_reg",
+                 help="Clears all trained models, metrics, and plots from this tab, so you can "
+                      "start a completely fresh run without any leftover results from before."):
+        resetear_prefijo("reg_")
+        st.rerun()
 
     st.markdown("**Reference value (continuous Y variable)**")
     modo_y = st.radio("How do you want to load the reference values?",
@@ -2103,17 +2253,22 @@ with tabs[8]:
                                               "of how the model performs on unseen data. 0 means skip "
                                               "this and use every sample for cross-validation instead.")
                 metodo_split_sel_r = st.selectbox(
-                    "Test set selection", ["Random", "Kennard-Stone (representative)"],
+                    "Test set selection", ["Random", "SPXY (extended Kennard-Stone)"],
                     disabled=(prop_test_r == 0), key="split_reg",
                     help="How to choose which samples go into the test set. 'Random' picks them by "
-                         "chance. 'Kennard-Stone' deliberately spreads the training set across the "
-                         "full spectral/Y range instead.",
+                         "chance. 'SPXY' is an extended version of Kennard-Stone made specifically "
+                         "for regression (Galvão et al., 2005): plain Kennard-Stone only looks at "
+                         "the spectra, with no guarantee the reference value (Y) range is well "
+                         "represented too; SPXY adds the Y range into the same calculation, so the "
+                         "training set is spread out across BOTH the spectral space AND the Y range "
+                         "at once. It's the standard, widely-used way to fix that gap.",
                 )
-                metodo_split_r = "kennard_stone" if metodo_split_sel_r.startswith("Kennard-Stone") else "random"
+                metodo_split_r = "kennard_stone" if metodo_split_sel_r.startswith("SPXY") else "random"
                 if metodo_split_r == "kennard_stone":
-                    st.caption("ℹ️ Kennard-Stone picks the TRAINING set to broadly cover the spectral "
-                               "space (it will include the more 'extreme' samples); the remaining, more "
-                               "'typical' samples become the test set.")
+                    st.caption("ℹ️ SPXY (an extended Kennard-Stone for regression) picks the TRAINING "
+                               "set to broadly cover BOTH the spectral space and the reference value (Y) "
+                               "range at once (it will include the more 'extreme' samples in either "
+                               "sense); the remaining, more 'typical' samples become the test set.")
                 optimizar_r = st.checkbox(
                     "Optimize hyperparameters (slower)", key="opt_reg",
                     help="Automatically search for better settings for each model instead of using "
@@ -2137,18 +2292,35 @@ with tabs[8]:
                 st.caption(f"⚠ Optimizing hyperparameters for {', '.join(lentos_elegidos_r)} can still take a "
                            f"while on a shared/limited CPU. If it's too slow, try 'Fast', or fewer folds.{extra_r}")
 
+            if metodo_seleccion_r == "Boruta":
+                c1, c2 = st.columns(2)
+                boruta_max_iter_r = c1.slider(
+                    "Boruta iterations", 10, 150, 40, step=5, key="boruta_iter_reg",
+                    help="How many comparison rounds to run against the random 'shadow' variables. "
+                         "More iterations give a more stable decision but take longer.",
+                )
+                boruta_alpha_r = c2.select_slider(
+                    "Boruta p-value (alpha)", options=[0.01, 0.02, 0.05, 0.1], value=0.05, key="boruta_alpha_reg",
+                    help="Significance level for keeping a variable: smaller (e.g. 0.01) is stricter "
+                         "and keeps fewer, more confidently relevant variables; larger (e.g. 0.1) is "
+                         "more permissive.",
+                )
             if metodo_seleccion_r == "Genetic Algorithm":
                 c1, c2 = st.columns(2)
                 ga_poblacion_r = c1.slider("Population size", 10, 60, 20, key="ga_pob_reg")
                 ga_generaciones_r = c2.slider("Generations", 5, 50, 15, key="ga_gen_reg")
 
             if st.button("🚀 Train and evaluate (Regression)", disabled=len(modelos_elegidos_r) == 0):
+                for _clave in ["reg_pvalores", "reg_puntajes_cv", "reg_comparacion_metodo",
+                                "reg_curva_aprendizaje", "reg_curva_modelo", "reg_ultima_ficha"]:
+                    st.session_state.pop(_clave, None)
                 mascara_variables_r = None
                 with st.spinner("Selecting variables..." if metodo_seleccion_r != "None" else "Training..."):
                     if metodo_seleccion_r == "Boruta":
                         try:
                             mascara_variables_r = mu.seleccionar_variables_boruta(
-                                X_reg, y_reg, es_clasificacion=False, max_iter=40,
+                                X_reg, y_reg, es_clasificacion=False,
+                                max_iter=boruta_max_iter_r, alpha=boruta_alpha_r,
                             )
                             if mascara_variables_r.sum() == 0:
                                 st.warning("Boruta did not select any variable; using all of them.")
@@ -2329,9 +2501,12 @@ with tabs[8]:
                     res = resultados_r[nombre_detalle_r]
 
                     if hiperparametros_optimos_r.get(nombre_detalle_r):
-                        st.caption("⚙️ Optimal hyperparameters found: " +
-                                   ", ".join(f"{k}={v}" for k, v in hiperparametros_optimos_r[nombre_detalle_r].items()))
-                        st.caption(f"🔧 Optimization method: {descripcion_opt_usada_r.get(nombre_detalle_r, 'n/a')}")
+                        with st.container(border=True):
+                            st.markdown(f"**⚙️ Optimized hyperparameters — {nombre_detalle_r}**")
+                            cols_hp_r = st.columns(len(hiperparametros_optimos_r[nombre_detalle_r]))
+                            for col_hp, (k, v) in zip(cols_hp_r, hiperparametros_optimos_r[nombre_detalle_r].items()):
+                                col_hp.metric(k, str(v))
+                            st.caption(f"🔧 Method: {descripcion_opt_usada_r.get(nombre_detalle_r, 'n/a')}")
 
                     fuente_r = st.radio("Predicted vs. actual on:", ["CV", "Test"] if "test" in res else ["CV"],
                                          horizontal=True, key="fuente_reg",

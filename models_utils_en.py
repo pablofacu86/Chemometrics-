@@ -176,7 +176,8 @@ GRILLAS_CLASIFICACION = {
     "PLS-DA": {"n_components": [2, 3, 5, 7, 10]},
     "Logistic Regression": {"C": [0.01, 0.1, 1, 10, 100]},
     "Naive Bayes": {"var_smoothing": [1e-9, 1e-7, 1e-5]},
-    "Random Forest": {"n_estimators": [100, 200, 300], "max_depth": [None, 10, 20]},
+    "Random Forest": {"n_estimators": [100, 200, 300], "max_depth": [None, 10, 20],
+                       "max_features": ["sqrt", "log2", None]},
     "SVM": {"C": [0.1, 1, 10, 100], "gamma": ["scale", "auto", 0.01, 0.1]},
     "Decision Tree": {"max_depth": [None, 3, 5, 10, 20]},
     "XGBoost": {"n_estimators": [100, 200, 300], "max_depth": [3, 5, 7], "learning_rate": [0.05, 0.1, 0.3]},
@@ -190,7 +191,8 @@ GRILLAS_REGRESION = {
     "Lasso": {"alpha": [0.001, 0.01, 0.1, 1]},
     "Ridge": {"alpha": [0.01, 0.1, 1, 10, 100]},
     "Elastic Net": {"alpha": [0.001, 0.01, 0.1, 1], "l1_ratio": [0.1, 0.5, 0.9]},
-    "Random Forest": {"n_estimators": [100, 200, 300], "max_depth": [None, 10, 20]},
+    "Random Forest": {"n_estimators": [100, 200, 300], "max_depth": [None, 10, 20],
+                       "max_features": [1.0, "sqrt", "log2"]},
     "SVM (SVR)": {"C": [0.1, 1, 10, 100], "gamma": ["scale", "auto", 0.01, 0.1], "epsilon": [0.01, 0.1, 0.5]},
     "Decision Tree": {"max_depth": [None, 3, 5, 10, 20]},
     "XGBoost": {"n_estimators": [100, 200, 300], "max_depth": [3, 5, 7], "learning_rate": [0.05, 0.1, 0.3]},
@@ -457,6 +459,48 @@ def kennard_stone(X, n_seleccionar):
         return np.arange(n_seleccionar)
 
     dist = squareform(pdist(X))
+    return _seleccion_por_distancia_maxima(dist, n_seleccionar)
+
+
+def spxy(X, y, n_seleccionar):
+    """
+    SPXY (Sample set Partitioning based on joint X-Y distances): the
+    regression-specific extension of Kennard-Stone (Galvão et al., 2005).
+    Plain Kennard-Stone only looks at spectral (X) distance, which covers
+    the spectral space well but gives no guarantee that the reference (Y)
+    range is also well represented in both sets — e.g. the calibration set
+    could end up missing the low end of the concentration range even while
+    covering the spectral variability broadly. SPXY combines a normalized
+    X-distance with a normalized Y-distance (the difference in reference
+    value), so the selected calibration set is spread out across BOTH the
+    spectral space and the concentration range at once.
+    Returns the indices of the selected samples, in selection order.
+    """
+    from scipy.spatial.distance import pdist, squareform
+    n = X.shape[0]
+    n_seleccionar = min(n_seleccionar, n)
+    if n_seleccionar < 2:
+        return np.arange(n_seleccionar)
+
+    dist_x = squareform(pdist(X))
+    y_col = np.asarray(y, dtype=float).reshape(-1, 1)
+    dist_y = squareform(pdist(y_col))
+
+    # Normalize each distance matrix by its own maximum, so X and Y
+    # contribute comparably regardless of their original scales/units.
+    max_x = dist_x.max()
+    max_y = dist_y.max()
+    dist_x_norm = dist_x / max_x if max_x > 0 else dist_x
+    dist_y_norm = dist_y / max_y if max_y > 0 else dist_y
+    dist_combinada = dist_x_norm + dist_y_norm
+
+    return _seleccion_por_distancia_maxima(dist_combinada, n_seleccionar)
+
+
+def _seleccion_por_distancia_maxima(dist, n_seleccionar):
+    """Shared greedy 'farthest point' selection used by both Kennard-Stone
+    and SPXY — only the distance matrix passed in differs between them."""
+    n = dist.shape[0]
     i, j = np.unravel_index(np.argmax(dist), dist.shape)
     seleccionados = [int(i), int(j)]
     restantes = [k for k in range(n) if k not in seleccionados]
@@ -480,15 +524,41 @@ def dividir_train_test(X, y, ids, proporcion_test=0.2, es_clasificacion=True,
     Returns (idx_train, idx_test).
     metodo_split:
       - "random": stratified random split (default).
-      - "kennard_stone": Kennard-Stone selects the TRAINING set to cover the
-        X-space broadly; the remaining samples become the test set. Not
-        stratified by class — for very unbalanced datasets, check the
-        resulting class counts in each set.
+      - "kennard_stone": for classification, plain Kennard-Stone (X-distance
+        only) is run SEPARATELY within each class, so every class
+        contributes its own proportional share to both train and test
+        (otherwise a class made up mostly of "extreme"/outlying samples
+        could end up entirely in training, with zero representation in the
+        test set). For regression, SPXY is used instead of plain
+        Kennard-Stone: it combines spectral (X) distance with a distance in
+        the reference value (Y), so the training set is spread out across
+        BOTH the spectral space AND the concentration range — plain
+        Kennard-Stone alone gives no such guarantee for the Y range.
     """
     idx = np.arange(len(y))
     if metodo_split == "kennard_stone":
+        if es_clasificacion:
+            idx_train_partes, idx_test_partes = [], []
+            for clase in np.unique(y):
+                idx_clase = idx[y == clase]
+                if len(idx_clase) < 2:
+                    # Too few samples in this class to hold any out — keep it all in training.
+                    idx_train_partes.append(idx_clase)
+                    continue
+                n_train_clase = max(1, int(round(len(idx_clase) * (1 - proporcion_test))))
+                n_train_clase = min(n_train_clase, len(idx_clase) - 1) if proporcion_test > 0 else len(idx_clase)
+                seleccion_local = kennard_stone(X[idx_clase], n_train_clase)
+                idx_train_clase = idx_clase[seleccion_local]
+                idx_test_clase = np.array([i for i in idx_clase if i not in set(idx_train_clase.tolist())])
+                idx_train_partes.append(idx_train_clase)
+                if len(idx_test_clase):
+                    idx_test_partes.append(idx_test_clase)
+            idx_train = np.concatenate(idx_train_partes)
+            idx_test = np.concatenate(idx_test_partes) if idx_test_partes else np.array([], dtype=int)
+            return idx_train, idx_test
+
         n_train = int(round(len(y) * (1 - proporcion_test)))
-        idx_train = kennard_stone(X, n_train)
+        idx_train = spxy(X, y, n_train)
         idx_test = np.array([i for i in idx if i not in set(idx_train.tolist())])
         return idx_train, idx_test
 
@@ -613,12 +683,18 @@ def exportar_predicciones_regresion(ids, y_true, y_pred):
 # SELECCIÓN DE VARIABLES: BORUTA
 # =============================================================================
 
-def seleccionar_variables_boruta(X, y, es_clasificacion, random_state=0, max_iter=50):
+def seleccionar_variables_boruta(X, y, es_clasificacion, random_state=0, max_iter=50, alpha=0.05):
     """
     Selección de variables con Boruta: compara la importancia de cada
     variable real contra copias aleatorizadas de sí mismas ("variables
     sombra"), y se queda con las que superan consistentemente a su versión
     aleatoria. Devuelve una máscara booleana (True = variable seleccionada).
+
+    max_iter: cuántas rondas de comparación como máximo se corren (más
+    rondas = decisión más estable, pero más lento).
+    alpha: nivel de significancia del test estadístico interno que decide
+    si una variable gana o pierde contra su sombra en cada ronda (más chico
+    = más exigente para aceptar una variable como relevante).
     """
     from boruta import BorutaPy
 
@@ -628,7 +704,8 @@ def seleccionar_variables_boruta(X, y, es_clasificacion, random_state=0, max_ite
         estimador = RandomForestRegressor(n_estimators=200, random_state=random_state, n_jobs=-1)
 
     seleccionador = BorutaPy(
-        estimador, n_estimators="auto", random_state=random_state, max_iter=max_iter, verbose=0
+        estimador, n_estimators="auto", random_state=random_state, max_iter=max_iter,
+        alpha=alpha, verbose=0,
     )
     seleccionador.fit(np.asarray(X, dtype=float), np.asarray(y))
     return seleccionador.support_
