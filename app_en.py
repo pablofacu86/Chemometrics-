@@ -279,6 +279,33 @@ with st.sidebar:
         except FileNotFoundError:
             st.caption("(Guide file not found — make sure assets/theoretical_guide.pdf is included.)")
 
+    with st.expander("📤 Load a saved project"):
+        st.caption("Restores data, preprocessing, and saved models from a project file downloaded "
+                   "earlier — the fastest way to pick up exactly where you left off. This is "
+                   "available whether or not you already have data loaded (it overwrites whatever "
+                   "is currently loaded).")
+        archivo_proyecto = st.file_uploader(
+            "Project file (.joblib)", type=["joblib"], key="cargar_proyecto",
+        )
+        if archivo_proyecto is not None and st.button("📤 Load this project"):
+            try:
+                proyecto_cargado = joblib.load(archivo_proyecto)
+                claves_esperadas_proyecto = {
+                    "df", "ids", "numeros_onda", "X", "clases", "mascara_excluidas",
+                    "X_pret", "numeros_onda_pret", "pasos_pretratamiento",
+                    "valores_y", "modelos_guardados",
+                }
+                claves_faltantes = claves_esperadas_proyecto - set(proyecto_cargado.keys())
+                if len(claves_faltantes) > 2:
+                    st.error("This file doesn't look like a project saved by this app.")
+                else:
+                    for k, v in proyecto_cargado.items():
+                        st.session_state[k] = v
+                    st.success("Project loaded successfully.")
+                    st.rerun()
+            except Exception as e:
+                st.error(f"Could not load the project file: {e}")
+
     st.header("1. Load data")
     archivo = st.file_uploader(
         "Spectra file",
@@ -406,6 +433,10 @@ with st.sidebar:
             st.session_state.X = X
             if cambio_tamano:
                 st.session_state.mascara_excluidas = np.zeros(X.shape[0], dtype=bool)
+            if archivo_realmente_nuevo or cambio_tamano:
+                # A genuinely different file was loaded (or the sample count changed) — clear
+                # classes/reference values from the PREVIOUS dataset unless the new file itself
+                # already supplies them, so stale labels from an unrelated dataset never linger.
                 if clases_desde_archivo is None:
                     st.session_state.clases = None
                 if valores_y_desde_archivo is None:
@@ -464,8 +495,10 @@ with st.sidebar:
             )
 
             if modo_clases == "None":
-                if clases_desde_archivo is None:
-                    st.session_state.clases = None
+                pass  # no-op: keep whatever classes are already loaded (from a project, a
+                      # previous file, etc.) — classes are only cleared when a genuinely new
+                      # file is loaded (see 'archivo_realmente_nuevo' below), never just
+                      # because this radio's default option happens to be showing.
 
             elif modo_clases == "Extract from ID (separator)":
                 sep = st.text_input("Separator in the ID", value="_")
@@ -518,7 +551,7 @@ with st.sidebar:
         if n_excluidas > 0:
             st.info(f"🚫 {n_excluidas} sample(s) excluded as outliers ('Outliers' tab).")
 
-        with st.expander("📁 Full project (save everything / resume later)"):
+        with st.expander("💾 Save full project"):
             st.caption("Bundles your data, preprocessing settings, and every saved model into a "
                        "single file, so you can close the app and pick up exactly where you left "
                        "off — instead of re-uploading the spectra and retraining everything.")
@@ -537,26 +570,6 @@ with st.sidebar:
                     "⬇️ Download project file", data=st.session_state["_proyecto_bytes"],
                     file_name="chemometrics_project.joblib", mime="application/octet-stream",
                 )
-
-            st.divider()
-            archivo_proyecto = st.file_uploader(
-                "Load a project file (.joblib)", type=["joblib"], key="cargar_proyecto",
-                help="Restores the data, preprocessing, and saved models from a project file "
-                     "downloaded earlier — overwrites what's currently loaded in the app.",
-            )
-            if archivo_proyecto is not None and st.button("📤 Load this project"):
-                try:
-                    proyecto_cargado = joblib.load(archivo_proyecto)
-                    claves_faltantes = set(CLAVES_PROYECTO) - set(proyecto_cargado.keys())
-                    if len(claves_faltantes) > 2:
-                        st.error("This file doesn't look like a project saved by this app.")
-                    else:
-                        for k, v in proyecto_cargado.items():
-                            st.session_state[k] = v
-                        st.success("Project loaded successfully.")
-                        st.rerun()
-                except Exception as e:
-                    st.error(f"Could not load the project file: {e}")
 
 
 # =============================================================================
@@ -2222,41 +2235,57 @@ with tabs[8]:
         resetear_prefijo("reg_")
         st.rerun()
 
-    st.markdown("**Reference value (continuous Y variable)**")
-    modo_y = st.radio("How do you want to load the reference values?",
-                       ["Enter manually", "Upload file (id, value)"], horizontal=True,
-                       help="The Y variable you want to predict (e.g. a lab-measured concentration) "
-                            "for each sample, in the same order as your spectra.")
+    if st.session_state.valores_y is None:
+        st.markdown("**Reference value (continuous Y variable)**")
+        st.caption("Not loaded yet. Easiest: go back to the sidebar's 'Reference value column' "
+                   "selector when (re-)loading your data file. Or define it here instead:")
+        modo_y = st.radio("How do you want to load the reference values?",
+                           ["Enter manually", "Upload file (id, value)"], horizontal=True,
+                           help="The Y variable you want to predict (e.g. a lab-measured concentration) "
+                                "for each sample, in the same order as your spectra.")
 
-    if modo_y == "Enter manually":
-        st.caption("One value per sample, comma-separated, in the same order as the IDs:")
-        st.code(", ".join(st.session_state.ids[:8]) + (", ..." if len(st.session_state.ids) > 8 else ""))
-        texto_y = st.text_area("Values (comma-separated)", key="texto_valores_y")
-        if texto_y.strip():
-            try:
-                lista_y = [float(v.strip()) for v in texto_y.split(",")]
-                if len(lista_y) != len(st.session_state.ids):
-                    st.error(f"You entered {len(lista_y)} values but there are {len(st.session_state.ids)} samples.")
-                else:
-                    st.session_state.valores_y = np.array(lista_y, dtype=float)
-            except ValueError:
-                st.error("Some value could not be parsed as a number.")
+        if modo_y == "Enter manually":
+            st.caption("One value per sample, comma-separated, in the same order as the IDs:")
+            st.code(", ".join(st.session_state.ids[:8]) + (", ..." if len(st.session_state.ids) > 8 else ""))
+            texto_y = st.text_area("Values (comma-separated)", key="texto_valores_y")
+            if texto_y.strip():
+                try:
+                    lista_y = [float(v.strip()) for v in texto_y.split(",")]
+                    if len(lista_y) != len(st.session_state.ids):
+                        st.error(f"You entered {len(lista_y)} values but there are {len(st.session_state.ids)} samples.")
+                    else:
+                        st.session_state.valores_y = np.array(lista_y, dtype=float)
+                        st.rerun()
+                except ValueError:
+                    st.error("Some value could not be parsed as a number.")
+        else:
+            archivo_y = st.file_uploader(
+                "File with columns: id, value", type=["csv", "xlsx", "xls"], key="valores_y_csv",
+            )
+            if archivo_y is not None:
+                try:
+                    if archivo_y.name.lower().endswith(".csv"):
+                        df_y = pd.read_csv(archivo_y)
+                    else:
+                        df_y = pd.read_excel(archivo_y)
+                    df_y = df_y.set_index(df_y.columns[0])
+                    df_y.index = df_y.index.astype(str)
+                    mapa_y = df_y.iloc[:, 0].to_dict()
+                    valores_y = np.array([mapa_y.get(str(i), np.nan) for i in st.session_state.ids], dtype=float)
+                    n_faltantes = int(np.isnan(valores_y).sum())
+                    if n_faltantes > 0:
+                        st.warning(f"{n_faltantes} sample(s) without a reference value in the file — "
+                                   "they are automatically excluded from the regression.")
+                    st.session_state.valores_y = valores_y
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error reading the file: {e}")
     else:
-        archivo_y = st.file_uploader("CSV with columns: id, value", type=["csv"], key="valores_y_csv")
-        if archivo_y is not None:
-            try:
-                df_y = pd.read_csv(archivo_y)
-                df_y = df_y.set_index(df_y.columns[0])
-                df_y.index = df_y.index.astype(str)
-                mapa_y = df_y.iloc[:, 0].to_dict()
-                valores_y = np.array([mapa_y.get(str(i), np.nan) for i in st.session_state.ids], dtype=float)
-                n_faltantes = int(np.isnan(valores_y).sum())
-                if n_faltantes > 0:
-                    st.warning(f"{n_faltantes} sample(s) without a reference value in the file — "
-                               "they are automatically excluded from the regression.")
-                st.session_state.valores_y = valores_y
-            except Exception as e:
-                st.error(f"Error reading the file: {e}")
+        col_y1, col_y2 = st.columns([4, 1])
+        col_y1.success(f"✓ Reference values loaded for {len(st.session_state.valores_y)} samples.")
+        if col_y2.button("Change", help="Clear the loaded reference values to enter or upload different ones."):
+            st.session_state.valores_y = None
+            st.rerun()
 
     if st.session_state.valores_y is None:
         st.info("Load the reference values to be able to train a regression model.")
